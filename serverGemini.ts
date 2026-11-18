@@ -6,9 +6,12 @@
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash';
+export const DEFAULT_GEMINI_FALLBACK_MODEL = '';
 export const DEFAULT_GEMINI_TIMEOUT_MS = 75_000; // 75 seconds per multimodal attempt (60-90s target)
-export const DEFAULT_GEMINI_MAX_RETRIES = 2; // Max 3 total attempts (initial + 2 bounded retries)
-export const DEFAULT_GEMINI_RETRY_BASE_DELAY_MS = 800;
+export const DEFAULT_GEMINI_MAX_RETRIES = 2; // Max 3 total primary attempts (initial + 2 bounded retries)
+export const DEFAULT_GEMINI_RETRY_BASE_DELAY_MS = 4_000; // Retry 1 ~2-4s, Retry 2 ~4-8s with equal jitter
+export const DEFAULT_GEMINI_RETRY_MAX_DELAY_MS = 10_000; // Bounded max backoff per retry wait
+export const MAX_GEMINI_RETRY_AFTER_MS = 15_000; // Safety cap on honored Retry-After header waits
 export const MAX_GEMINI_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB raw upload ceiling
 
 const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -28,7 +31,7 @@ export type GeminiErrorCategory =
 
 export interface GeminiErrorDiagnosis {
   category: GeminiErrorCategory;
-  httpStatus: 502 | 504;
+  httpStatus: 502 | 503 | 504;
   upstreamStatus: number | null;
   retryable: boolean;
   userMessage: string;
@@ -92,6 +95,27 @@ export function getConfiguredGeminiModel(overrideModel?: string | null): string 
   return DEFAULT_GEMINI_MODEL;
 }
 
+export function getConfiguredFallbackGeminiModel(
+  overrideFallbackModel?: string | null,
+  primaryModel?: string
+): string | null {
+  let candidate = '';
+  if (overrideFallbackModel !== undefined) {
+    candidate = typeof overrideFallbackModel === 'string' ? overrideFallbackModel.trim() : '';
+  } else if (typeof process.env.GEMINI_FALLBACK_MODEL === 'string') {
+    candidate = process.env.GEMINI_FALLBACK_MODEL.trim();
+  } else {
+    candidate = DEFAULT_GEMINI_FALLBACK_MODEL;
+  }
+
+  const normalized = candidate.replace(/^models\//, '').trim();
+  if (!normalized) return null;
+  if (primaryModel && normalized === primaryModel.replace(/^models\//, '').trim()) {
+    return null;
+  }
+  return normalized;
+}
+
 export function getGeminiTimeoutMs(overrideTimeoutMs?: number | null): number {
   if (typeof overrideTimeoutMs === 'number' && Number.isFinite(overrideTimeoutMs) && overrideTimeoutMs > 0) {
     return Math.min(Math.max(Math.round(overrideTimeoutMs), 50), 180_000);
@@ -118,6 +142,20 @@ export function getGeminiMaxRetries(overrideMaxRetries?: number | null): number 
     }
   }
   return DEFAULT_GEMINI_MAX_RETRIES;
+}
+
+export function getGeminiRetryBaseDelayMs(overrideBaseDelayMs?: number | null): number {
+  if (typeof overrideBaseDelayMs === 'number' && Number.isFinite(overrideBaseDelayMs) && overrideBaseDelayMs >= 0) {
+    return Math.min(Math.round(overrideBaseDelayMs), 30_000);
+  }
+  const raw = process.env.GEMINI_RETRY_BASE_DELAY_MS;
+  if (raw !== undefined && raw.trim() !== '') {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return Math.min(parsed, 30_000);
+    }
+  }
+  return DEFAULT_GEMINI_RETRY_BASE_DELAY_MS;
 }
 
 export function getGeminiMethodLabel(modelId: string): string {
@@ -272,6 +310,99 @@ function extractNumericStatus(err: any): number | null {
   return null;
 }
 
+function readHeaderValue(headers: any, targetName: string): string | null {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') {
+    const val = headers.get(targetName);
+    return typeof val === 'string' && val.trim() ? val.trim() : null;
+  }
+  if (typeof headers === 'object') {
+    const lowerTarget = targetName.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lowerTarget && v !== undefined && v !== null) {
+        const str = Array.isArray(v) ? String(v[0] ?? '') : String(v);
+        return str.trim() || null;
+      }
+    }
+  }
+  return null;
+}
+
+export function extractRetryAfterMs(err: any, nowMs = Date.now()): number | null {
+  const headerVal =
+    readHeaderValue(err?.response?.headers, 'retry-after') ??
+    readHeaderValue(err?.headers, 'retry-after') ??
+    (typeof err?.retryAfter === 'string' || typeof err?.retryAfter === 'number'
+      ? String(err.retryAfter).trim()
+      : null);
+
+  if (headerVal) {
+    if (/^\d+(?:\.\d+)?$/.test(headerVal)) {
+      const seconds = Number.parseFloat(headerVal);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        return Math.round(seconds * 1000);
+      }
+    } else {
+      const targetMs = Date.parse(headerVal);
+      if (Number.isFinite(targetMs) && targetMs > nowMs) {
+        return Math.round(targetMs - nowMs);
+      }
+    }
+  }
+
+  // Also check Google RPC RetryInfo metadata if surfaced on error details (e.g. "4s" or "2.5s")
+  const details = Array.isArray(err?.error?.details)
+    ? err.error.details
+    : Array.isArray(err?.details)
+    ? err.details
+    : [];
+  for (const detail of details) {
+    const retryDelay = typeof detail?.retryDelay === 'string' ? detail.retryDelay.trim() : '';
+    const secMatch = retryDelay.match(/^(\d+(?:\.\d+)?)s$/i);
+    if (secMatch) {
+      const secs = Number.parseFloat(secMatch[1]);
+      if (Number.isFinite(secs) && secs > 0) {
+        return Math.round(secs * 1000);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Computes bounded exponential backoff with Equal Jitter (`exp / 2 + rand(0, exp / 2)`),
+ * honoring valid Retry-After headers up to a strict safety cap.
+ */
+export function calculateGeminiRetryDelayMs(params: {
+  attempt: number;
+  baseDelayMs: number;
+  maxDelayMs?: number;
+  retryAfterMs?: number | null;
+  randomFn?: () => number;
+}): number {
+  const maxDelayMs =
+    typeof params.maxDelayMs === 'number' && Number.isFinite(params.maxDelayMs) && params.maxDelayMs >= 0
+      ? params.maxDelayMs
+      : DEFAULT_GEMINI_RETRY_MAX_DELAY_MS;
+  const rand = typeof params.randomFn === 'function' ? params.randomFn : Math.random;
+  const clampedRand = Math.min(Math.max(rand(), 0), 1);
+
+  let backoffMs = 0;
+  if (params.baseDelayMs > 0) {
+    const expCap = Math.min(maxDelayMs, params.baseDelayMs * Math.pow(2, Math.max(0, params.attempt - 1)));
+    const half = expCap / 2;
+    backoffMs = Math.round(half + clampedRand * half);
+  }
+
+  if (typeof params.retryAfterMs === 'number' && Number.isFinite(params.retryAfterMs) && params.retryAfterMs > 0) {
+    const boundedRetryAfter = Math.min(Math.round(params.retryAfterMs), MAX_GEMINI_RETRY_AFTER_MS);
+    return Math.max(backoffMs, boundedRetryAfter);
+  }
+
+  return backoffMs;
+}
+
 export function classifyGeminiError(
   err: any,
   modelId: string,
@@ -343,7 +474,10 @@ export function classifyGeminiError(
   }
 
   if (upstreamStatus === 429 || /RESOURCE_EXHAUSTED|quota|rate limit|too many requests/i.test(rawMsg)) {
-    const isHardQuotaExhausted = /limit:\s*0|daily limit|billing|free_tier.*exceeded/i.test(rawMsg);
+    const isHardQuotaExhausted =
+      /limit:\s*0|daily limit|per[_ ]?day|quota exceeded for quota metric.*day|billing|free_tier.*exceeded|exhausted.*daily/i.test(
+        rawMsg
+      );
     return {
       category: 'RATE_LIMITED_OR_QUOTA',
       httpStatus: 502,
@@ -356,7 +490,19 @@ export function classifyGeminiError(
     };
   }
 
-  if (upstreamStatus === 500 || upstreamStatus === 502 || upstreamStatus === 503) {
+  if (upstreamStatus === 503) {
+    return {
+      category: 'UPSTREAM_UNAVAILABLE',
+      httpStatus: 503,
+      upstreamStatus: 503,
+      retryable: true,
+      userMessage:
+        'Gemini upstream service temporarily unavailable due to high model demand (HTTP 503). Report saved safely and ready for retry.',
+      safeLogMessage: rawMsg,
+    };
+  }
+
+  if (upstreamStatus === 500 || upstreamStatus === 502) {
     return {
       category: 'UPSTREAM_UNAVAILABLE',
       httpStatus: 502,
@@ -425,22 +571,25 @@ export async function runGeminiFloodAssessment(params: {
   endpointLabel: string;
   reportId?: string;
   modelOverride?: string | null;
+  fallbackModelOverride?: string | null;
   timeoutMsOverride?: number | null;
   maxRetriesOverride?: number | null;
   retryBaseDelayMsOverride?: number | null;
   aiClientFactory?: (apiKey: string) => GeminiClientLike;
+  sleepFn?: (ms: number) => Promise<void>;
   onSuccess?: () => void;
   onError?: (safeMessage: string) => void;
 }): Promise<GeminiAssessmentResult> {
   const requestId = createGeminiRequestId();
-  const modelId = getConfiguredGeminiModel(params.modelOverride);
-  const methodLabel = getGeminiMethodLabel(modelId);
+  const primaryModelId = getConfiguredGeminiModel(params.modelOverride);
+  const configuredFallbackModel = getConfiguredFallbackGeminiModel(
+    params.fallbackModelOverride,
+    primaryModelId
+  );
   const timeoutMs = getGeminiTimeoutMs(params.timeoutMsOverride);
   const maxRetries = getGeminiMaxRetries(params.maxRetriesOverride);
-  const retryBaseDelayMs =
-    typeof params.retryBaseDelayMsOverride === 'number' && params.retryBaseDelayMsOverride >= 0
-      ? params.retryBaseDelayMsOverride
-      : DEFAULT_GEMINI_RETRY_BASE_DELAY_MS;
+  const retryBaseDelayMs = getGeminiRetryBaseDelayMs(params.retryBaseDelayMsOverride);
+  const sleep = params.sleepFn ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const ts = new Date().toISOString();
   const disclaimer =
     'AI image assessment is an assistive early warning signal only. Official verification requires authorized emergency officer confirmation.';
@@ -451,7 +600,7 @@ export async function runGeminiFloodAssessment(params: {
       requestId,
       payload: {
         method: 'Gemini AI (Unconfigured)',
-        modelName: modelId,
+        modelName: primaryModelId,
         aiStatus: 'UNCONFIGURED',
         hasVisibleFlooding: false,
         aiAssessment: 'AI Verification Not Configured',
@@ -471,6 +620,7 @@ export async function runGeminiFloodAssessment(params: {
     };
   }
 
+  // Explicitly set SDK retryOptions.attempts = 1 so SDK retries NEVER multiply with application-level retries
   const ai = params.aiClientFactory
     ? params.aiClientFactory(params.geminiKey)
     : new GoogleGenAI({
@@ -478,6 +628,9 @@ export async function runGeminiFloodAssessment(params: {
         httpOptions: {
           headers: {
             'User-Agent': 'aistudio-build',
+          },
+          retryOptions: {
+            attempts: 1,
           },
         },
       });
@@ -537,12 +690,7 @@ Provide confidenceScore strictly as a percentage from 0 to 100 (e.g., 88 for 88%
     ],
   };
 
-  let lastDiagnosis: GeminiErrorDiagnosis | null = null;
-  let parsed: any = null;
-
-  const totalAttempts = 1 + maxRetries;
-
-  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+  const invokeModelOnce = async (targetModelId: string): Promise<any> => {
     const controller = new AbortController();
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
@@ -562,15 +710,20 @@ Provide confidenceScore strictly as a percentage from 0 to 100 (e.g., 88 for 88%
         abortSignal: controller.signal,
         responseMimeType: 'application/json',
         responseSchema,
+        httpOptions: {
+          retryOptions: {
+            attempts: 1,
+          },
+        },
       };
-      if (supportsThinkingLevelConfig(modelId)) {
+      if (supportsThinkingLevelConfig(targetModelId)) {
         requestConfig.thinkingConfig = {
           thinkingLevel: ThinkingLevel.LOW,
         };
       }
 
       const callPromise = ai.models.generateContent({
-        model: modelId,
+        model: targetModelId,
         contents: {
           parts: [
             {
@@ -588,11 +741,6 @@ Provide confidenceScore strictly as a percentage from 0 to 100 (e.g., 88 for 88%
       });
 
       const geminiRes = await Promise.race([callPromise, timeoutPromise]);
-      if (timeoutHandle !== undefined) {
-        clearTimeout(timeoutHandle);
-        timeoutHandle = undefined;
-      }
-
       const candidateParsed = parseGeminiJsonResponse(geminiRes?.text || '');
       if (
         typeof candidateParsed.confidenceScore !== 'number' ||
@@ -602,51 +750,113 @@ Provide confidenceScore strictly as a percentage from 0 to 100 (e.g., 88 for 88%
       ) {
         throw new Error('Gemini output omitted a valid numeric confidenceScore (0-100)');
       }
-      parsed = candidateParsed;
-      lastDiagnosis = null;
-      break;
-    } catch (err: any) {
+      return candidateParsed;
+    } finally {
       if (timeoutHandle !== undefined) {
         clearTimeout(timeoutHandle);
         timeoutHandle = undefined;
       }
+    }
+  };
 
-      const diagnosis = classifyGeminiError(err, modelId, timeoutMs);
+  let lastDiagnosis: GeminiErrorDiagnosis | null = null;
+  let parsed: any = null;
+  let succeededModelId = primaryModelId;
+  let finalFailedModelId = primaryModelId;
+
+  const primaryTotalAttempts = 1 + maxRetries;
+
+  for (let attempt = 1; attempt <= primaryTotalAttempts; attempt++) {
+    try {
+      parsed = await invokeModelOnce(primaryModelId);
+      succeededModelId = primaryModelId;
+      lastDiagnosis = null;
+      break;
+    } catch (err: any) {
+      const diagnosis = classifyGeminiError(err, primaryModelId, timeoutMs);
       lastDiagnosis = diagnosis;
+      finalFailedModelId = primaryModelId;
 
       // Safe structured telemetry log: NEVER logs API keys, credentials, Base64 image data, or PII
       console.error(
         `[FloodSense AI] requestId=${requestId} endpoint=${params.endpointLabel}` +
-          `${params.reportId ? ` reportId=${params.reportId}` : ''} model=${modelId}` +
-          ` attempt=${attempt}/${totalAttempts} upstreamStatus=${diagnosis.upstreamStatus ?? 'N/A'}` +
+          `${params.reportId ? ` reportId=${params.reportId}` : ''} model=${primaryModelId}` +
+          ` attempt=${attempt}/${primaryTotalAttempts} upstreamStatus=${diagnosis.upstreamStatus ?? 'N/A'}` +
           ` category=${diagnosis.category} retryable=${diagnosis.retryable} msg="${diagnosis.safeLogMessage}"`
       );
 
-      if (!diagnosis.retryable || attempt >= totalAttempts) {
+      if (!diagnosis.retryable || attempt >= primaryTotalAttempts) {
         break;
       }
 
-      // Limited exponential backoff with small jitter
-      const jitterMs = retryBaseDelayMs > 0 ? Math.floor(Math.random() * 150) : 0;
-      const delayMs = retryBaseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
+      const retryAfterMs = extractRetryAfterMs(err);
+      const delayMs = calculateGeminiRetryDelayMs({
+        attempt,
+        baseDelayMs: retryBaseDelayMs,
+        maxDelayMs: DEFAULT_GEMINI_RETRY_MAX_DELAY_MS,
+        retryAfterMs,
+      });
       if (delayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await sleep(delayMs);
       }
+    }
+  }
+
+  // Optional single-attempt failover strictly for persistent 503 UPSTREAM_UNAVAILABLE,
+  // and ONLY when GEMINI_FALLBACK_MODEL is explicitly configured AND confirmed via Gemini API model list.
+  if (
+    (!parsed || lastDiagnosis) &&
+    lastDiagnosis?.category === 'UPSTREAM_UNAVAILABLE' &&
+    lastDiagnosis?.upstreamStatus === 503 &&
+    configuredFallbackModel
+  ) {
+    const fallbackCheck = await confirmFallbackModelSupport(
+      ai,
+      params.geminiKey,
+      primaryModelId,
+      configuredFallbackModel,
+      params.aiClientFactory
+    );
+
+    if (fallbackCheck.confirmed) {
+      try {
+        parsed = await invokeModelOnce(configuredFallbackModel);
+        succeededModelId = configuredFallbackModel;
+        lastDiagnosis = null;
+      } catch (fallbackErr: any) {
+        const fallbackDiagnosis = classifyGeminiError(fallbackErr, configuredFallbackModel, timeoutMs);
+        lastDiagnosis = fallbackDiagnosis;
+        finalFailedModelId = configuredFallbackModel;
+
+        console.error(
+          `[FloodSense AI] requestId=${requestId} endpoint=${params.endpointLabel}` +
+            `${params.reportId ? ` reportId=${params.reportId}` : ''} model=${configuredFallbackModel}` +
+            ` attempt=fallback-1/1 upstreamStatus=${fallbackDiagnosis.upstreamStatus ?? 'N/A'}` +
+            ` category=${fallbackDiagnosis.category} retryable=${fallbackDiagnosis.retryable} msg="${fallbackDiagnosis.safeLogMessage}"`
+        );
+      }
+    } else {
+      console.error(
+        `[FloodSense AI] requestId=${requestId} endpoint=${params.endpointLabel}` +
+          `${params.reportId ? ` reportId=${params.reportId}` : ''} model=${configuredFallbackModel}` +
+          ` attempt=fallback-skipped upstreamStatus=${lastDiagnosis.upstreamStatus ?? 'N/A'}` +
+          ` category=${lastDiagnosis.category} retryable=${lastDiagnosis.retryable} msg="${stripApiKeyFromText(fallbackCheck.reason || 'Fallback model not confirmed in official Gemini model list')}"`
+      );
     }
   }
 
   if (!parsed || lastDiagnosis) {
     const finalDiag =
       lastDiagnosis ||
-      classifyGeminiError(new Error('Gemini multimodal verification failed.'), modelId, timeoutMs);
+      classifyGeminiError(new Error('Gemini multimodal verification failed.'), finalFailedModelId, timeoutMs);
     params.onError?.(finalDiag.safeLogMessage);
     return {
       statusCode: finalDiag.httpStatus,
       requestId,
       diagnosis: finalDiag,
       payload: {
-        method: methodLabel,
-        modelName: modelId,
+        method: getGeminiMethodLabel(finalFailedModelId),
+        modelName: finalFailedModelId,
         aiStatus: 'FAILED',
         hasVisibleFlooding: false,
         aiAssessment: 'AI Processing Failed',
@@ -688,8 +898,8 @@ Provide confidenceScore strictly as a percentage from 0 to 100 (e.g., 88 for 88%
     statusCode: 200,
     requestId,
     payload: {
-      method: methodLabel,
-      modelName: modelId,
+      method: getGeminiMethodLabel(succeededModelId),
+      modelName: succeededModelId,
       aiStatus: 'COMPLETED',
       hasVisibleFlooding: Boolean(parsed.hasVisibleFlooding),
       aiAssessment,
@@ -713,11 +923,119 @@ Provide confidenceScore strictly as a percentage from 0 to 100 (e.g., 88 for 88%
   };
 }
 
+interface ModelListRecord {
+  name: string;
+  supportedActions?: string[];
+}
+
 let cachedModelProbe: {
   checkedAt: number;
-  models: string[];
+  models: ModelListRecord[];
   error?: string;
 } | null = null;
+
+async function fetchGeminiModelList(
+  ai: GeminiClientLike,
+  useCache: boolean
+): Promise<{
+  probed: boolean;
+  models: ModelListRecord[];
+  error?: string;
+}> {
+  const now = Date.now();
+  if (useCache && cachedModelProbe && now - cachedModelProbe.checkedAt <= 15 * 60 * 1000) {
+    return {
+      probed: true,
+      models: cachedModelProbe.models,
+      error: cachedModelProbe.error,
+    };
+  }
+
+  if (typeof ai.models?.list !== 'function') {
+    return {
+      probed: false,
+      models: [],
+      error: 'Gemini client models.list() unavailable',
+    };
+  }
+
+  try {
+    const pager = await ai.models.list();
+    const found: ModelListRecord[] = [];
+    for await (const m of pager) {
+      if (m?.name) {
+        const shortName = String(m.name).replace(/^models\//, '');
+        if (shortName.includes('gemini')) {
+          found.push({
+            name: shortName,
+            supportedActions: Array.isArray(m.supportedActions) ? m.supportedActions : undefined,
+          });
+        }
+      }
+      if (found.length >= 60) break;
+    }
+    if (useCache) {
+      cachedModelProbe = { checkedAt: now, models: found };
+    }
+    return { probed: true, models: found };
+  } catch (err: any) {
+    const safeErr = stripApiKeyFromText(err?.message || 'Unable to list Gemini models');
+    if (useCache) {
+      cachedModelProbe = { checkedAt: now, models: [], error: safeErr };
+    }
+    return { probed: true, models: [], error: safeErr };
+  }
+}
+
+function isModelSupportingMultimodalJson(record: ModelListRecord | undefined, modelId: string): boolean {
+  if (!record) return false;
+  if (/(image|tts|live|embedding|transcribe|decision)/i.test(modelId)) {
+    return false;
+  }
+  if (Array.isArray(record.supportedActions)) {
+    return record.supportedActions.includes('generateContent');
+  }
+  return true;
+}
+
+async function confirmFallbackModelSupport(
+  ai: GeminiClientLike,
+  _geminiKey: string,
+  primaryModelId: string,
+  fallbackModelId: string,
+  aiClientFactory?: (apiKey: string) => GeminiClientLike
+): Promise<{ confirmed: boolean; reason?: string }> {
+  if (!fallbackModelId || fallbackModelId === primaryModelId) {
+    return { confirmed: false, reason: 'No distinct fallback model configured.' };
+  }
+  if (/(image|tts|live|embedding|transcribe|decision)/i.test(fallbackModelId)) {
+    return { confirmed: false, reason: `Fallback model "${fallbackModelId}" is not a multimodal content model.` };
+  }
+
+  // Only bypass global cache when test factory is injected
+  const probe = await fetchGeminiModelList(ai, !aiClientFactory);
+  if (!probe.probed) {
+    return {
+      confirmed: false,
+      reason: `Cannot confirm fallback model "${fallbackModelId}" without official Gemini API model list.`,
+    };
+  }
+  if (probe.error) {
+    return {
+      confirmed: false,
+      reason: `Failed to verify fallback model "${fallbackModelId}" in Gemini model list: ${probe.error}`,
+    };
+  }
+
+  const matched = probe.models.find((m) => m.name === fallbackModelId);
+  if (!isModelSupportingMultimodalJson(matched, fallbackModelId)) {
+    return {
+      confirmed: false,
+      reason: `Fallback model "${fallbackModelId}" not confirmed for generateContent in Gemini API model list.`,
+    };
+  }
+  return { confirmed: true };
+}
 
 /**
  * Checks which Gemini models are visible to the configured API key (cached 15 min, metadata-only).
@@ -725,10 +1043,12 @@ let cachedModelProbe: {
 export async function probeAvailableGeminiModels(
   geminiKey: string | null,
   configuredModel: string,
-  aiClientFactory?: (apiKey: string) => GeminiClientLike
+  aiClientFactory?: (apiKey: string) => GeminiClientLike,
+  fallbackModel?: string | null
 ): Promise<{
   probed: boolean;
   configuredModelAvailable: boolean | null;
+  fallbackModelAvailable?: boolean | null;
   intended38FlashAvailable: boolean | null;
   hydrogenAvailable: boolean | null;
   sampleModels: string[];
@@ -738,71 +1058,60 @@ export async function probeAvailableGeminiModels(
     return {
       probed: false,
       configuredModelAvailable: null,
+      fallbackModelAvailable: null,
       intended38FlashAvailable: null,
       hydrogenAvailable: null,
       sampleModels: [],
     };
   }
 
-  const now = Date.now();
-  if (!cachedModelProbe || now - cachedModelProbe.checkedAt > 15 * 60 * 1000) {
-    try {
-      const ai = aiClientFactory
-        ? aiClientFactory(geminiKey)
-        : new GoogleGenAI({
-            apiKey: geminiKey,
-            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-          });
+  const ai = aiClientFactory
+    ? aiClientFactory(geminiKey)
+    : new GoogleGenAI({
+        apiKey: geminiKey,
+        httpOptions: {
+          headers: { 'User-Agent': 'aistudio-build' },
+          retryOptions: { attempts: 1 },
+        },
+      });
 
-      if (typeof ai.models?.list !== 'function') {
-        return {
-          probed: false,
-          configuredModelAvailable: null,
-          intended38FlashAvailable: null,
-          hydrogenAvailable: null,
-          sampleModels: [],
-        };
-      }
-
-      const pager = await ai.models.list();
-      const found: string[] = [];
-      for await (const m of pager) {
-        if (m?.name) {
-          const shortName = String(m.name).replace(/^models\//, '');
-          if (shortName.includes('gemini')) {
-            found.push(shortName);
-          }
-        }
-        if (found.length >= 60) break;
-      }
-      cachedModelProbe = { checkedAt: now, models: found };
-    } catch (err: any) {
-      cachedModelProbe = {
-        checkedAt: now,
-        models: [],
-        error: stripApiKeyFromText(err?.message || 'Unable to list Gemini models'),
-      };
-    }
+  const probe = await fetchGeminiModelList(ai, !aiClientFactory);
+  if (!probe.probed) {
+    return {
+      probed: false,
+      configuredModelAvailable: null,
+      fallbackModelAvailable: null,
+      intended38FlashAvailable: null,
+      hydrogenAvailable: null,
+      sampleModels: [],
+    };
   }
 
-  if (cachedModelProbe.error) {
+  if (probe.error) {
     return {
       probed: true,
       configuredModelAvailable: null,
+      fallbackModelAvailable: null,
       intended38FlashAvailable: null,
       hydrogenAvailable: null,
       sampleModels: [],
-      error: cachedModelProbe.error,
+      error: probe.error,
     };
   }
 
-  const list = cachedModelProbe.models;
-  const hasModel = (id: string) => list.includes(id.replace(/^models\//, ''));
+  const list = probe.models;
+  const hasModel = (id: string) =>
+    isModelSupportingMultimodalJson(
+      list.find((m) => m.name === id.replace(/^models\//, '')),
+      id.replace(/^models\//, '')
+    );
+
   return {
     probed: true,
     configuredModelAvailable: hasModel(configuredModel),
+    fallbackModelAvailable: fallbackModel ? hasModel(fallbackModel) : null,
     intended38FlashAvailable: hasModel('gemini-3.8-flash'),
     hydrogenAvailable: hasModel('gemini-4-hydrogen'),
-    sampleModels: list.slice(0, 12),
+    sampleModels: list.map((m) => m.name).slice(0, 12),
   };
 }

@@ -8,6 +8,17 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AddressInfo } from 'node:net';
 import { createApiApp, detectImageMimeFromBuffer, extractNext3HourForecast, ServerTestOverrides } from './server.ts';
+import {
+  calculateGeminiRetryDelayMs,
+  extractRetryAfterMs,
+  getGeminiMaxRetries,
+  getGeminiRetryBaseDelayMs,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_RETRY_BASE_DELAY_MS,
+  DEFAULT_GEMINI_RETRY_MAX_DELAY_MS,
+  MAX_GEMINI_RETRY_AFTER_MS,
+  runGeminiFloodAssessment,
+} from './serverGemini.ts';
 
 async function withTestServer(
   overrides: ServerTestOverrides,
@@ -1665,6 +1676,508 @@ test('POST /api/reports/:reportId/retry-ai prevents concurrent duplicate retries
     await new Promise<void>((r) => srv.close(() => r()));
   }
 });
+
+function makeMockModelList(models: Array<{ name: string; supportedActions?: string[] }>) {
+  return async () => ({
+    async *[Symbol.asyncIterator]() {
+      for (const m of models) {
+        yield { name: `models/${m.name}`, supportedActions: m.supportedActions };
+      }
+    },
+  });
+}
+
+test('calculateGeminiRetryDelayMs and extractRetryAfterMs enforce equal jitter, bounds, and Retry-After headers', () => {
+  assert.equal(DEFAULT_GEMINI_MODEL, 'gemini-3.8-flash');
+  assert.ok(DEFAULT_GEMINI_RETRY_BASE_DELAY_MS >= 2000, 'Base delay must be meaningful (>= 2000ms)');
+
+  // Retry 1 with default base=4000: equal jitter stays in [2000, 4000] ms
+  const r1Min = calculateGeminiRetryDelayMs({
+    attempt: 1,
+    baseDelayMs: DEFAULT_GEMINI_RETRY_BASE_DELAY_MS,
+    randomFn: () => 0,
+  });
+  const r1Max = calculateGeminiRetryDelayMs({
+    attempt: 1,
+    baseDelayMs: DEFAULT_GEMINI_RETRY_BASE_DELAY_MS,
+    randomFn: () => 1,
+  });
+  assert.equal(r1Min, 2000);
+  assert.equal(r1Max, 4000);
+
+  // Retry 2 with default base=4000: equal jitter stays in [4000, 8000] ms (~5-8s)
+  const r2Min = calculateGeminiRetryDelayMs({
+    attempt: 2,
+    baseDelayMs: DEFAULT_GEMINI_RETRY_BASE_DELAY_MS,
+    randomFn: () => 0,
+  });
+  const r2Max = calculateGeminiRetryDelayMs({
+    attempt: 2,
+    baseDelayMs: DEFAULT_GEMINI_RETRY_BASE_DELAY_MS,
+    randomFn: () => 1,
+  });
+  assert.equal(r2Min, 4000);
+  assert.equal(r2Max, 8000);
+
+  // Attempt 5 is strictly capped by maxDelayMs
+  const rCapped = calculateGeminiRetryDelayMs({
+    attempt: 5,
+    baseDelayMs: DEFAULT_GEMINI_RETRY_BASE_DELAY_MS,
+    maxDelayMs: DEFAULT_GEMINI_RETRY_MAX_DELAY_MS,
+    randomFn: () => 1,
+  });
+  assert.equal(rCapped, DEFAULT_GEMINI_RETRY_MAX_DELAY_MS);
+
+  // Retry-After extraction from numeric header, Headers.get(), HTTP-date, and Google RetryInfo
+  assert.equal(extractRetryAfterMs({ response: { headers: new Headers({ 'retry-after': '6' }) } }), 6000);
+  assert.equal(extractRetryAfterMs({ headers: { 'Retry-After': '3' } }), 3000);
+  assert.equal(
+    extractRetryAfterMs({ error: { details: [{ retryDelay: '7s' }] } }),
+    7000
+  );
+
+  // Valid Retry-After larger than computed backoff is honored, while extreme Retry-After is capped safely
+  assert.equal(
+    calculateGeminiRetryDelayMs({
+      attempt: 1,
+      baseDelayMs: 4000,
+      retryAfterMs: 9000,
+      randomFn: () => 0,
+    }),
+    9000
+  );
+  assert.equal(
+    calculateGeminiRetryDelayMs({
+      attempt: 1,
+      baseDelayMs: 4000,
+      retryAfterMs: 300_000,
+      randomFn: () => 0,
+    }),
+    MAX_GEMINI_RETRY_AFTER_MS
+  );
+
+  // Retries clamp bounds cleanly
+  assert.equal(getGeminiMaxRetries(99), 4);
+  assert.equal(getGeminiMaxRetries(-5), 0);
+  assert.equal(getGeminiRetryBaseDelayMs(999_999), 30_000);
+});
+
+test('Primary model gemini-3.8-flash succeeds on retry after upstream 503 and honors Retry-After cleanly', async () => {
+  const sleepCalls: number[] = [];
+  const calledModels: string[] = [];
+  let attemptCount = 0;
+
+  const result = await runGeminiFloodAssessment({
+    geminiKey: 'test-key-503-recover',
+    cleanBase64: makeFakeJpegBase64(),
+    detectedMime: 'image/jpeg',
+    waterLevel: 'High',
+    floodType: 'Flash Flood',
+    description: 'Water surging across junction',
+    endpointLabel: 'POST /api/ai/verify',
+    maxRetriesOverride: 2,
+    retryBaseDelayMsOverride: 2500,
+    sleepFn: async (ms) => {
+      sleepCalls.push(ms);
+    },
+    aiClientFactory: () => ({
+      models: {
+        generateContent: async (args: any) => {
+          attemptCount += 1;
+          calledModels.push(args.model);
+          assert.equal(args.config?.httpOptions?.retryOptions?.attempts, 1);
+          if (attemptCount === 1) {
+            const err: any = new Error('503 Service Unavailable: The model is currently experiencing high demand.');
+            err.status = 503;
+            err.response = { headers: new Headers({ 'Retry-After': '5' }) };
+            throw err;
+          }
+          return {
+            text: JSON.stringify({
+              hasVisibleFlooding: true,
+              confidenceScore: 92,
+              assessment: 'Possible Flooding Detected',
+              observedWaterLevel: 'High',
+              observedAccessibility: 'Partially Blocked',
+              detailedExplanation: 'Floodwater visible across road lanes.',
+              uncertaintyNotes: 'Light rain glare.',
+            }),
+          };
+        },
+      },
+    }),
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(attemptCount, 2);
+  assert.deepEqual(calledModels, ['gemini-3.8-flash', 'gemini-3.8-flash']);
+  assert.equal(sleepCalls.length, 1);
+  assert.ok(sleepCalls[0] >= 5000, `Expected honored Retry-After >= 5000ms, got ${sleepCalls[0]}`);
+  assert.equal(result.payload.aiStatus, 'COMPLETED');
+  assert.equal(result.payload.modelName, 'gemini-3.8-flash');
+  assert.equal(result.payload.officialStatus, 'Under Review');
+});
+
+test('Repeated 503 fails over once to confirmed GEMINI_FALLBACK_MODEL (gemini-3.7-flash), skips unconfirmed fallback, and returns 503 when both fail', async () => {
+  // 1. Primary returns repeated 503; models.list confirms gemini-3.7-flash supports generateContent -> fallback succeeds once
+  const calls1: string[] = [];
+  await withTestServer(
+    {
+      geminiApiKey: 'test-key-fallback-ok',
+      geminiModel: 'gemini-3.8-flash',
+      geminiFallbackModel: 'gemini-3.7-flash',
+      geminiMaxRetries: 2,
+      geminiRetryBaseDelayMs: 0,
+      aiClientFactory: () => ({
+        models: {
+          list: makeMockModelList([
+            { name: 'gemini-3.8-flash', supportedActions: ['generateContent'] },
+            { name: 'gemini-3.7-flash', supportedActions: ['generateContent'] },
+          ]),
+          generateContent: async (args: any) => {
+            calls1.push(args.model);
+            if (args.model === 'gemini-3.8-flash') {
+              throw Object.assign(new Error('503: The model is currently experiencing high demand.'), { status: 503 });
+            }
+            return {
+              text: JSON.stringify({
+                hasVisibleFlooding: true,
+                confidenceScore: 84,
+                assessment: 'Possible Flooding Detected',
+                observedWaterLevel: 'Moderate',
+                observedAccessibility: 'Partially Blocked',
+                detailedExplanation: 'Fallback model confirmed street flooding.',
+                uncertaintyNotes: 'Overcast conditions.',
+              }),
+            };
+          },
+        },
+      }),
+    },
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64: makeFakeJpegBase64(), mimeType: 'image/jpeg' }),
+      });
+      assert.equal(res.status, 200);
+      assert.deepEqual(calls1, [
+        'gemini-3.8-flash',
+        'gemini-3.8-flash',
+        'gemini-3.8-flash',
+        'gemini-3.7-flash',
+      ]);
+      const body = await res.json();
+      assert.equal(body.aiStatus, 'COMPLETED');
+      assert.equal(body.modelName, 'gemini-3.7-flash');
+      assert.equal(body.officialStatus, 'Under Review');
+    }
+  );
+
+  // 2. Fallback NOT confirmed in official Gemini model list -> never switches models, returns HTTP 503
+  const calls2: string[] = [];
+  await withTestServer(
+    {
+      geminiApiKey: 'test-key-unconfirmed-fallback',
+      geminiModel: 'gemini-3.8-flash',
+      geminiFallbackModel: 'gemini-3.7-flash',
+      geminiMaxRetries: 2,
+      geminiRetryBaseDelayMs: 0,
+      aiClientFactory: () => ({
+        models: {
+          list: makeMockModelList([{ name: 'gemini-3.8-flash', supportedActions: ['generateContent'] }]),
+          generateContent: async (args: any) => {
+            calls2.push(args.model);
+            throw Object.assign(new Error('503: The model is currently experiencing high demand.'), { status: 503 });
+          },
+        },
+      }),
+    },
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64: makeFakeJpegBase64(), mimeType: 'image/jpeg' }),
+      });
+      assert.equal(res.status, 503);
+      assert.deepEqual(calls2, ['gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.8-flash']);
+      const body = await res.json();
+      assert.equal(body.aiStatus, 'FAILED');
+      assert.equal(body.diagnosticCode, 'UPSTREAM_UNAVAILABLE');
+      assert.equal(body.upstreamStatus, 503);
+      assert.equal(body.officialStatus, 'Under Review');
+    }
+  );
+
+  // 3. Both primary and confirmed fallback return 503 -> bounded total attempts (3 + 1), returns HTTP 503 FAILED
+  const calls3: string[] = [];
+  await withTestServer(
+    {
+      geminiApiKey: 'test-key-both-fail',
+      geminiModel: 'gemini-3.8-flash',
+      geminiFallbackModel: 'gemini-3.7-flash',
+      geminiMaxRetries: 2,
+      geminiRetryBaseDelayMs: 0,
+      aiClientFactory: () => ({
+        models: {
+          list: makeMockModelList([
+            { name: 'gemini-3.8-flash', supportedActions: ['generateContent'] },
+            { name: 'gemini-3.7-flash', supportedActions: ['generateContent'] },
+          ]),
+          generateContent: async (args: any) => {
+            calls3.push(args.model);
+            throw Object.assign(new Error('503: Service overloaded.'), { status: 503 });
+          },
+        },
+      }),
+    },
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64: makeFakeJpegBase64(), mimeType: 'image/jpeg' }),
+      });
+      assert.equal(res.status, 503);
+      assert.deepEqual(calls3, [
+        'gemini-3.8-flash',
+        'gemini-3.8-flash',
+        'gemini-3.8-flash',
+        'gemini-3.7-flash',
+      ]);
+      const body = await res.json();
+      assert.equal(body.aiStatus, 'FAILED');
+      assert.equal(body.diagnosticCode, 'UPSTREAM_UNAVAILABLE');
+      assert.equal(body.upstreamStatus, 503);
+      assert.equal(body.confidence, null);
+      assert.equal(body.retryable, true);
+      assert.equal(body.officialStatus, 'Under Review');
+    }
+  );
+});
+
+test('HTTP 429 rate-limit/quota does NOT trigger fallback failover and exhausted daily quota is not retried', async () => {
+  // 1. Transient 429 retries up to primary bound and NEVER fails over to fallback model
+  const callsTransient429: string[] = [];
+  await withTestServer(
+    {
+      geminiApiKey: 'test-key-429-transient',
+      geminiModel: 'gemini-3.8-flash',
+      geminiFallbackModel: 'gemini-3.7-flash',
+      geminiMaxRetries: 2,
+      geminiRetryBaseDelayMs: 0,
+      aiClientFactory: () => ({
+        models: {
+          list: makeMockModelList([
+            { name: 'gemini-3.8-flash', supportedActions: ['generateContent'] },
+            { name: 'gemini-3.7-flash', supportedActions: ['generateContent'] },
+          ]),
+          generateContent: async (args: any) => {
+            callsTransient429.push(args.model);
+            throw Object.assign(new Error('429 RESOURCE_EXHAUSTED: Per-minute rate limit reached'), { status: 429 });
+          },
+        },
+      }),
+    },
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64: makeFakeJpegBase64(), mimeType: 'image/jpeg' }),
+      });
+      assert.equal(res.status, 502);
+      assert.deepEqual(callsTransient429, ['gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.8-flash']);
+      const body = await res.json();
+      assert.equal(body.diagnosticCode, 'RATE_LIMITED_OR_QUOTA');
+      assert.equal(body.upstreamStatus, 429);
+      assert.equal(body.retryable, true);
+    }
+  );
+
+  // 2. Exhausted daily quota (limit: 0 / daily limit) stops immediately on attempt 1 without retry or failover
+  const callsDaily429: string[] = [];
+  await withTestServer(
+    {
+      geminiApiKey: 'test-key-429-daily',
+      geminiModel: 'gemini-3.8-flash',
+      geminiFallbackModel: 'gemini-3.7-flash',
+      geminiMaxRetries: 2,
+      geminiRetryBaseDelayMs: 0,
+      aiClientFactory: () => ({
+        models: {
+          list: makeMockModelList([
+            { name: 'gemini-3.8-flash', supportedActions: ['generateContent'] },
+            { name: 'gemini-3.7-flash', supportedActions: ['generateContent'] },
+          ]),
+          generateContent: async (args: any) => {
+            callsDaily429.push(args.model);
+            throw Object.assign(new Error('429 RESOURCE_EXHAUSTED: Quota exceeded, daily limit reached (limit: 0)'), {
+              status: 429,
+            });
+          },
+        },
+      }),
+    },
+    async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/api/ai/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64: makeFakeJpegBase64(), mimeType: 'image/jpeg' }),
+      });
+      assert.equal(res.status, 502);
+      assert.deepEqual(callsDaily429, ['gemini-3.8-flash']);
+      const body = await res.json();
+      assert.equal(body.diagnosticCode, 'RATE_LIMITED_OR_QUOTA');
+      assert.equal(body.upstreamStatus, 429);
+      assert.equal(body.retryable, false);
+    }
+  );
+});
+
+test('POST /api/reports/:reportId/retry-ai preserves existing report, report ID, verificationStatus, and diagnostics when Gemini returns repeated 503', async () => {
+  const reportsDb: Record<string, any> = {
+    'REP-503-SAVE-1': {
+      id: 'REP-503-SAVE-1',
+      reporterId: 'citizen-owner',
+      location: 'Maradana Flyover Underpass',
+      area: 'Maradana',
+      lat: 6.9292,
+      lng: 79.8659,
+      waterLevel: 'High',
+      floodType: 'Flash Flood',
+      description: 'Water rising past curb',
+      incidentStatus: 'Submitted',
+      verificationStatus: 'UNDER REVIEW',
+      hasEvidence: true,
+      primaryEvidenceId: 'primary',
+      statusHistory: [
+        {
+          status: 'Submitted',
+          timestamp: '2026-11-17T20:00:00.000Z',
+          authorName: 'Citizen Reporter',
+          note: 'Report registered.',
+        },
+      ],
+    },
+  };
+  const evidenceDb: Record<string, Record<string, any>> = {
+    'REP-503-SAVE-1': {
+      primary: {
+        ownerUid: 'citizen-owner',
+        mimeType: 'image/jpeg',
+        base64Data: makeFakeJpegBase64(),
+      },
+    },
+  };
+  const statusHistoryStore: Record<string, any> = {};
+
+  const mockFirestore = {
+    collection: (colName: string) => ({
+      doc: (docId: string) => ({
+        get: async () => {
+          const store = colName === 'reports' ? reportsDb : statusHistoryStore;
+          return store[docId]
+            ? { exists: true, id: docId, data: () => store[docId] }
+            : { exists: false, id: docId, data: () => undefined };
+        },
+        set: async (data: any) => {
+          const store = colName === 'reports' ? reportsDb : statusHistoryStore;
+          store[docId] = { ...(store[docId] || {}), ...data };
+        },
+        collection: (subName: string) => ({
+          doc: (subId: string) => ({
+            get: async () => {
+              const ev = subName === 'evidence' ? evidenceDb[docId]?.[subId] : undefined;
+              return ev
+                ? { exists: true, id: subId, data: () => ev }
+                : { exists: false, id: subId, data: () => undefined };
+            },
+          }),
+        }),
+      }),
+    }),
+  };
+
+  let attemptNumber = 0;
+  const app = createApiApp({
+    forceSkipAuthCheck: false,
+    geminiApiKey: 'test-key-retry-503',
+    geminiFallbackModel: 'gemini-3.7-flash',
+    geminiMaxRetries: 2,
+    geminiRetryBaseDelayMs: 0,
+    aiClientFactory: () => ({
+      models: {
+        list: makeMockModelList([
+          { name: 'gemini-3.8-flash', supportedActions: ['generateContent'] },
+          { name: 'gemini-3.7-flash', supportedActions: ['generateContent'] },
+        ]),
+        generateContent: async () => {
+          attemptNumber += 1;
+          // Fails on all 4 attempts during 1st retry-ai call; succeeds when retried later
+          if (attemptNumber <= 4) {
+            throw Object.assign(new Error('503: The model is currently experiencing high demand.'), { status: 503 });
+          }
+          return {
+            text: JSON.stringify({
+              hasVisibleFlooding: true,
+              confidenceScore: 89.5,
+              assessment: 'Possible Flooding Detected',
+              observedWaterLevel: 'High',
+              observedAccessibility: 'Partially Blocked',
+              detailedExplanation: 'Subsequent retry succeeded once capacity returned.',
+              uncertaintyNotes: 'None.',
+            }),
+          };
+        },
+      },
+    }),
+    adminOverride: {
+      verifyIdToken: async () => ({ uid: 'citizen-owner', role: 'citizen' }),
+      firestore: mockFirestore,
+    },
+  });
+
+  const srv = http.createServer(app);
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  const baseUrl = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+
+  try {
+    // 1. First retry fails with repeated 503 -> existing report remains saved, FAILED recorded cleanly, no duplicates
+    const failRes = await fetch(`${baseUrl}/api/reports/REP-503-SAVE-1/retry-ai`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token-owner' },
+    });
+    assert.equal(failRes.status, 200);
+    const failBody = await failRes.json();
+    assert.equal(failBody.ok, true);
+    assert.equal(failBody.aiSucceeded, false);
+    assert.equal(failBody.diagnosticCode, 'UPSTREAM_UNAVAILABLE');
+    assert.equal(failBody.upstreamStatus, 503);
+    assert.equal(Object.keys(reportsDb).length, 1);
+    assert.equal(reportsDb['REP-503-SAVE-1'].id, 'REP-503-SAVE-1');
+    assert.equal(reportsDb['REP-503-SAVE-1'].aiStatus, 'FAILED');
+    assert.equal(reportsDb['REP-503-SAVE-1'].verificationStatus, 'UNDER REVIEW');
+    assert.equal(reportsDb['REP-503-SAVE-1'].incidentStatus, 'Submitted');
+    assert.equal(reportsDb['REP-503-SAVE-1'].aiVerificationDetails.diagnosticCode, 'UPSTREAM_UNAVAILABLE');
+    assert.equal(reportsDb['REP-503-SAVE-1'].aiVerificationDetails.upstreamStatus, 503);
+    assert.ok(evidenceDb['REP-503-SAVE-1'].primary.base64Data, 'Evidence photo must remain intact');
+
+    // 2. Subsequent retry-ai processes the SAME report & image and succeeds without auto-verifying
+    const recoverRes = await fetch(`${baseUrl}/api/reports/REP-503-SAVE-1/retry-ai`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token-owner' },
+    });
+    assert.equal(recoverRes.status, 200);
+    const recoverBody = await recoverRes.json();
+    assert.equal(recoverBody.aiSucceeded, true);
+    assert.equal(Object.keys(reportsDb).length, 1);
+    assert.equal(reportsDb['REP-503-SAVE-1'].aiStatus, 'COMPLETED');
+    assert.equal(reportsDb['REP-503-SAVE-1'].aiConfidence, 89.5);
+    assert.equal(reportsDb['REP-503-SAVE-1'].verificationStatus, 'UNDER REVIEW');
+  } finally {
+    await new Promise<void>((r) => srv.close(() => r()));
+  }
+});
+
 
 
 

@@ -29,8 +29,10 @@ import {
   runGeminiFloodAssessment,
   probeAvailableGeminiModels,
   getConfiguredGeminiModel,
+  getConfiguredFallbackGeminiModel,
   getGeminiTimeoutMs,
   getGeminiMaxRetries,
+  getGeminiRetryBaseDelayMs,
   GeminiClientLike,
 } from './serverGemini.ts';
 
@@ -298,6 +300,7 @@ export interface AdminOverride {
 export interface ServerTestOverrides {
   geminiApiKey?: string | null;
   geminiModel?: string | null;
+  geminiFallbackModel?: string | null;
   geminiTimeoutMs?: number | null;
   geminiMaxRetries?: number | null;
   geminiRetryBaseDelayMs?: number | null;
@@ -934,11 +937,16 @@ export function createApiApp(overrides: ServerTestOverrides = {}) {
 
     // Gemini AI state (metadata-only model probe cached 15m; never burns generation quota on health checks)
     const activeGeminiModel = getConfiguredGeminiModel(overrides.geminiModel);
+    const activeFallbackModel = getConfiguredFallbackGeminiModel(
+      overrides.geminiFallbackModel,
+      activeGeminiModel
+    );
     const geminiTimeoutMs = getGeminiTimeoutMs(overrides.geminiTimeoutMs);
     const modelProbe = await probeAvailableGeminiModels(
       geminiKey,
       activeGeminiModel,
-      overrides.aiClientFactory
+      overrides.aiClientFactory,
+      activeFallbackModel
     );
 
     let geminiState: ServiceHealthState = 'NOT_CONFIGURED';
@@ -972,8 +980,10 @@ export function createApiApp(overrides: ServerTestOverrides = {}) {
           configured: Boolean(geminiKey),
           mode: geminiKey ? 'Live Multimodal AI (Server-Side)' : 'Unconfigured (Manual Review Required)',
           model: activeGeminiModel,
+          fallbackModel: activeFallbackModel,
           timeoutMs: geminiTimeoutMs,
           maxRetries: getGeminiMaxRetries(overrides.geminiMaxRetries),
+          retryBaseDelayMs: getGeminiRetryBaseDelayMs(overrides.geminiRetryBaseDelayMs),
           modelProbe,
           lastSuccess: lastAiSuccessTime,
           lastError: lastAiError,
@@ -1233,6 +1243,7 @@ export function createApiApp(overrides: ServerTestOverrides = {}) {
       description,
       endpointLabel: 'POST /api/ai/verify',
       modelOverride: overrides.geminiModel,
+      fallbackModelOverride: overrides.geminiFallbackModel,
       timeoutMsOverride: overrides.geminiTimeoutMs,
       maxRetriesOverride: overrides.geminiMaxRetries,
       retryBaseDelayMsOverride: overrides.geminiRetryBaseDelayMs,
@@ -1388,6 +1399,7 @@ export function createApiApp(overrides: ServerTestOverrides = {}) {
           endpointLabel: 'POST /api/reports/:reportId/retry-ai',
           reportId,
           modelOverride: overrides.geminiModel,
+          fallbackModelOverride: overrides.geminiFallbackModel,
           timeoutMsOverride: overrides.geminiTimeoutMs,
           maxRetriesOverride: overrides.geminiMaxRetries,
           retryBaseDelayMsOverride: overrides.geminiRetryBaseDelayMs,
@@ -1759,8 +1771,8 @@ async function startServer() {
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`FloodSense EOC Server running on http://0.0.0.0:${PORT}`);
   });
-  // Ensure HTTP socket/request timeouts strictly exceed bounded multi-attempt Gemini verification window
-  const configuredAiWindowMs = getGeminiTimeoutMs() * (getGeminiMaxRetries() + 1) + 45_000;
+  // Ensure HTTP socket/request timeouts strictly exceed bounded multi-attempt Gemini verification + fallback window
+  const configuredAiWindowMs = getGeminiTimeoutMs() * (getGeminiMaxRetries() + 2) + 60_000;
   httpServer.requestTimeout = Math.max(configuredAiWindowMs, 300_000);
   httpServer.headersTimeout = 65_000;
 }
