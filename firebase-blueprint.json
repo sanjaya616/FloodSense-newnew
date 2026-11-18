@@ -1,0 +1,177 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Registered FloodSense citizen or authorized emergency officer account",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "role": { "type": "string", "enum": ["citizen", "officer"] },
+        "department": { "type": "string" },
+        "badgeNumber": { "type": "string" },
+        "phone": { "type": "string" },
+        "emergencySector": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["uid", "name", "email", "role"]
+    },
+    "FloodReport": {
+      "title": "FloodReport",
+      "description": "Private citizen flood report stored in Firestore with PII isolated from public reads",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "location": { "type": "string" },
+        "area": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "waterLevel": { "type": "string", "enum": ["Low", "Moderate", "High", "Severe"] },
+        "roadAccessibility": { "type": "string", "enum": ["Open", "Partially Blocked", "Completely Blocked"] },
+        "floodType": { "type": "string", "enum": ["Street Waterlogging", "Flash Flood", "Canal Overflow", "Drainage Blockage"] },
+        "description": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "riskLevel": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+        "verificationStatus": { "type": "string", "enum": ["UNDER REVIEW", "VERIFIED", "REJECTED"] },
+        "incidentStatus": { "type": "string", "enum": ["Submitted", "Under Review", "More Info Requested", "Verified", "Alert Issued", "Resolved", "Rejected"] },
+        "reporterId": { "type": "string" },
+        "reporterName": { "type": "string" },
+        "reporterPhone": { "type": "string" },
+        "hasEvidence": { "type": "boolean" },
+        "evidenceCount": { "type": "integer" },
+        "primaryEvidenceId": { "type": "string" },
+        "evidenceStatus": { "type": "string", "enum": ["NONE", "SAVED", "FAILED"] },
+        "evidenceError": { "type": "string" },
+        "duplicateCheckStatus": { "type": "string", "enum": ["VERIFIED_CITYWIDE", "LOCAL_ONLY", "UNAVAILABLE"] },
+        "aiStatus": { "type": "string", "enum": ["NOT_RUN", "PENDING", "COMPLETED", "FAILED", "UNCONFIGURED"] },
+        "aiConfidence": { "type": ["number", "null"] },
+        "aiClassification": { "type": "string" },
+        "hotspotId": { "type": "string" },
+        "isDuplicate": { "type": "boolean" },
+        "duplicateOfReportId": { "type": "string" }
+      },
+      "required": ["id", "location", "area", "lat", "lng", "waterLevel", "roadAccessibility", "floodType", "timestamp", "reporterId", "incidentStatus"]
+    },
+    "ReportEvidence": {
+      "title": "ReportEvidence",
+      "description": "Compressed JPEG image evidence stored under /reports/{reportId}/evidence/{evidenceId} (Spark-plan compatible)",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string" },
+        "mimeType": { "type": "string", "enum": ["image/jpeg", "image/png", "image/webp"] },
+        "base64Data": { "type": "string" },
+        "fileName": { "type": "string" },
+        "byteSize": { "type": "integer" },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["ownerUid", "mimeType", "base64Data", "fileName", "byteSize", "width", "height", "createdAt"]
+    },
+    "PublicFloodReport": {
+      "title": "PublicFloodReport",
+      "description": "Privacy-redacted flood report for the public safety map with rounded ~100m grid coordinates and zero reporter PII",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "location": { "type": "string" },
+        "area": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "waterLevel": { "type": "string", "enum": ["Low", "Moderate", "High", "Severe"] },
+        "roadAccessibility": { "type": "string", "enum": ["Open", "Partially Blocked", "Completely Blocked"] },
+        "floodType": { "type": "string", "enum": ["Street Waterlogging", "Flash Flood", "Canal Overflow", "Drainage Blockage"] },
+        "description": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "riskLevel": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+        "verificationStatus": { "type": "string", "enum": ["UNDER REVIEW", "VERIFIED", "REJECTED"] },
+        "incidentStatus": { "type": "string", "enum": ["Submitted", "Under Review", "More Info Requested", "Verified", "Alert Issued", "Resolved", "Rejected"] },
+        "coordinatePrecision": { "type": "string", "enum": ["APPROX_100M_GRID"] }
+      },
+      "required": ["id", "location", "area", "lat", "lng", "waterLevel", "roadAccessibility", "floodType", "timestamp", "riskLevel", "verificationStatus", "incidentStatus"]
+    },
+    "FloodHotspot": {
+      "title": "FloodHotspot",
+      "description": "Geospatial connected-component cluster of nearby flood reports within 500m and 2 hours",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "location": { "type": "string" },
+        "area": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "reportCount": { "type": "integer" },
+        "forecastRainfallMm": { "type": "number" },
+        "riskLevel": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+        "riskScore": { "type": "number" },
+        "verificationStatus": { "type": "string", "enum": ["UNDER REVIEW", "VERIFIED", "REJECTED"] },
+        "precaution": { "type": "string" }
+      },
+      "required": ["id", "location", "area", "lat", "lng", "reportCount", "riskLevel", "riskScore"]
+    },
+    "BlockchainRecord": {
+      "title": "BlockchainRecord",
+      "description": "Tamper-evident SHA-256 hash-chain audit record for municipal verification snapshots",
+      "type": "object",
+      "properties": {
+        "eventId": { "type": "string" },
+        "hotspotId": { "type": "string" },
+        "location": { "type": "string" },
+        "severity": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+        "txHash": { "type": "string" },
+        "recordHash": { "type": "string" },
+        "prevHash": { "type": "string" },
+        "blockNumber": { "type": "integer" },
+        "payloadHash": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "network": { "type": "string" },
+        "status": { "type": "string" }
+      },
+      "required": ["eventId", "hotspotId", "location", "severity", "txHash", "blockNumber", "payloadHash", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user account profiles with role-based access"
+    },
+    "/officers/{officerId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authorized Emergency Officer directory"
+    },
+    "/reports/{reportId}": {
+      "schema": { "$ref": "#/entities/FloodReport" },
+      "description": "Private citizen flood reports visible only to the owner and authorized Emergency Officers"
+    },
+    "/reports/{reportId}/evidence/{evidenceId}": {
+      "schema": { "$ref": "#/entities/ReportEvidence" },
+      "description": "Private compressed Base64 photographic evidence subcollection accessible only to report owner and authorized Emergency Officers"
+    },
+    "/public_reports/{reportId}": {
+      "schema": { "$ref": "#/entities/PublicFloodReport" },
+      "description": "Public safety redacted flood reports containing zero PII and rounded coordinates"
+    },
+    "/hotspots/{hotspotId}": {
+      "schema": { "$ref": "#/entities/FloodHotspot" },
+      "description": "Public flood risk clusters"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "type": "object" },
+      "description": "Operational notifications"
+    },
+    "/status_history/{historyId}": {
+      "schema": { "type": "object" },
+      "description": "Immutable incident status audit transitions"
+    },
+    "/blockchain_records/{recordId}": {
+      "schema": { "$ref": "#/entities/BlockchainRecord" },
+      "description": "SHA-256 hash-chain audit registry"
+    },
+    "/settings/{settingId}": {
+      "schema": { "type": "object" },
+      "description": "Clustering and threshold system configuration"
+    }
+  }
+}

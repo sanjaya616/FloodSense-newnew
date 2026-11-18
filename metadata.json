@@ -1,0 +1,10 @@
+{
+  "name": "Remix Remix FloodSense — Urban Flood Intelligence \u0026 Early Warning",
+  "description": "AI-powered urban flood monitoring, real-time hotspot detection, predictive risk modeling, and auditable blockchain event registry for emergency authorities and citizens.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

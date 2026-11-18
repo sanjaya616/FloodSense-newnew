@@ -1,0 +1,291 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Two-role RBAC: CITIZEN vs EMERGENCY OFFICER (no admin role).
+    // Authoritative officer check relies strictly on custom claims or /officers/{uid}.
+    function isOfficer() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'officer' ||
+        request.auth.token.officer == true ||
+        exists(/databases/$(database)/documents/officers/$(request.auth.uid))
+      );
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function isValidUserCreate(data, userId) {
+      return data.keys().hasAll(['uid', 'name', 'email', 'role']) &&
+             data.uid == userId &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 120 &&
+             isValidEmail(data.email) &&
+             (!('role' in incoming()) || incoming().role == 'citizen') &&
+             (!('isOfficer' in incoming()) || incoming().isOfficer == false) &&
+             !('admin' in incoming()) &&
+             !('isAdmin' in incoming()) &&
+             (!('phone' in data) || (data.phone is string && data.phone.size() < 40)) &&
+             (!('emergencySector' in data) || (data.emergencySector is string && data.emergencySector.size() < 120));
+    }
+
+    function isValidUserSelfUpdate() {
+      return incoming().uid == existing().uid &&
+             (!('role' in incoming()) || incoming().role == existing().role) &&
+             incoming().email == existing().email &&
+             !incoming().diff(existing()).affectedKeys().hasAny([
+               'role', 'isOfficer', 'officer', 'admin', 'isAdmin',
+               'claims', 'customClaims', 'permissions', 'uid', 'email', 'createdAt'
+             ]) &&
+             incoming().diff(existing()).affectedKeys().hasOnly([
+               'name', 'displayName', 'phone', 'department', 'emergencySector', 'avatarUrl', 'updatedAt'
+             ]) &&
+             incoming().name is string && incoming().name.size() > 0 && incoming().name.size() < 120 &&
+             (!('phone' in incoming()) || (incoming().phone is string && incoming().phone.size() < 40)) &&
+             (!('emergencySector' in incoming()) || (incoming().emergencySector is string && incoming().emergencySector.size() < 120));
+    }
+
+    function isValidReportCreate(data) {
+      return data.keys().hasAll(['id', 'location', 'area', 'lat', 'lng', 'waterLevel', 'roadAccessibility', 'floodType', 'timestamp', 'reporterId', 'incidentStatus', 'verificationStatus']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() < 80 &&
+             data.reporterId == request.auth.uid &&
+             data.location is string && data.location.size() > 0 && data.location.size() < 240 &&
+             data.area is string && data.area.size() > 0 && data.area.size() < 120 &&
+             data.lat is number && data.lat >= -90 && data.lat <= 90 &&
+             data.lng is number && data.lng >= -180 && data.lng <= 180 &&
+             data.waterLevel in ['Low', 'Moderate', 'High', 'Severe'] &&
+             data.roadAccessibility in ['Open', 'Partially Blocked', 'Completely Blocked'] &&
+             data.floodType in ['Street Waterlogging', 'Flash Flood', 'Canal Overflow', 'Drainage Blockage'] &&
+             data.incidentStatus in ['Submitted', 'Under Review'] &&
+             data.verificationStatus == 'UNDER REVIEW' &&
+             !('base64Data' in data) &&
+             !('imageUrl' in data) &&
+             !('storagePath' in data) &&
+             !('imageStoragePath' in data) &&
+             (!('hasEvidence' in data) || data.hasEvidence is bool) &&
+             (!('evidenceCount' in data) || (data.evidenceCount is int && data.evidenceCount >= 0 && data.evidenceCount <= 5)) &&
+             (!('evidenceStatus' in data) || data.evidenceStatus in ['NONE', 'SAVED', 'FAILED']) &&
+             (!('duplicateCheckStatus' in data) || data.duplicateCheckStatus in ['VERIFIED_CITYWIDE', 'LOCAL_ONLY', 'UNAVAILABLE']) &&
+             (!('publicSyncStatus' in incoming()) || incoming().publicSyncStatus == 'PENDING') &&
+             (!('aiStatus' in data) || data.aiStatus in ['NOT_RUN', 'PENDING', 'COMPLETED', 'FAILED', 'UNCONFIGURED']) &&
+             (!('aiConfidence' in data) || data.aiConfidence == null || (data.aiConfidence is number && data.aiConfidence >= 0 && data.aiConfidence <= 100));
+    }
+
+    function isValidReportOwnerEvidenceUpdate() {
+      return isAuthenticated() &&
+             resource.data.reporterId == request.auth.uid &&
+             resource.data.incidentStatus in ['Submitted', 'Under Review', 'More Info Requested'] &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'hasEvidence', 'evidenceCount', 'primaryEvidenceId', 'evidenceStatus', 'evidenceError', 'updatedAt'
+             ]) &&
+             (!('hasEvidence' in request.resource.data) || request.resource.data.hasEvidence is bool) &&
+             (!('evidenceCount' in request.resource.data) || (request.resource.data.evidenceCount is int && request.resource.data.evidenceCount >= 0 && request.resource.data.evidenceCount <= 5)) &&
+             (!('evidenceStatus' in request.resource.data) || request.resource.data.evidenceStatus in ['NONE', 'SAVED', 'FAILED']) &&
+             (!('primaryEvidenceId' in request.resource.data) || request.resource.data.primaryEvidenceId == null || (request.resource.data.primaryEvidenceId is string && request.resource.data.primaryEvidenceId.size() <= 80));
+    }
+
+    function isValidReportOwnerAiUpdate() {
+      return isAuthenticated() &&
+             resource.data.reporterId == request.auth.uid &&
+             resource.data.verificationStatus == 'UNDER REVIEW' &&
+             resource.data.incidentStatus in ['Submitted', 'Under Review', 'More Info Requested'] &&
+             request.resource.data.verificationStatus == resource.data.verificationStatus &&
+             request.resource.data.riskLevel == resource.data.riskLevel &&
+             request.resource.data.reporterId == resource.data.reporterId &&
+             request.resource.data.incidentStatus in ['Submitted', 'Under Review'] &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'aiStatus', 'aiConfidence', 'aiClassification', 'aiVerificationDetails',
+               'incidentStatus', 'statusHistory', 'verificationStatus', 'updatedAt'
+             ]) &&
+             (!('aiStatus' in request.resource.data) || request.resource.data.aiStatus in ['NOT_RUN', 'PENDING', 'COMPLETED', 'FAILED', 'UNCONFIGURED']) &&
+             (!('aiConfidence' in request.resource.data) || request.resource.data.aiConfidence == null || (request.resource.data.aiConfidence is number && request.resource.data.aiConfidence >= 0 && request.resource.data.aiConfidence <= 100));
+    }
+
+    function isValidReportOfficerUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'incidentStatus', 'verificationStatus', 'riskLevel', 'statusHistory', 'officerNotes',
+        'verifiedAt', 'verificationTimestamp', 'verifiedBy', 'alertIssuedAt',
+        'aiStatus', 'aiConfidence', 'aiClassification', 'aiVerificationDetails',
+        'hasEvidence', 'evidenceCount', 'primaryEvidenceId', 'evidenceStatus', 'evidenceError',
+        'hotspotId', 'publicSyncStatus', 'publicSyncError', 'updatedAt'
+      ]) &&
+      request.resource.data.incidentStatus in ['Submitted', 'Under Review', 'More Info Requested', 'Verified', 'Alert Issued', 'Resolved', 'Rejected'] &&
+      request.resource.data.verificationStatus in ['UNDER REVIEW', 'VERIFIED', 'REJECTED'];
+    }
+
+    function isValidPublicReportWrite() {
+      return incoming().keys().hasAll(['id', 'location', 'area', 'lat', 'lng', 'waterLevel', 'roadAccessibility', 'floodType', 'timestamp', 'riskLevel', 'verificationStatus', 'incidentStatus']) &&
+             !('reporterName' in incoming()) &&
+             !('reporterPhone' in incoming()) &&
+             !('reporterEmail' in incoming()) &&
+             !('reporterId' in incoming()) &&
+             !('officerNotes' in incoming()) &&
+             !('imageUrl' in incoming()) &&
+             !('base64Data' in incoming()) &&
+             !('primaryEvidenceId' in incoming()) &&
+             !('evidenceIds' in incoming()) &&
+             !('storagePath' in incoming()) &&
+             !('imageStoragePath' in incoming());
+    }
+
+    function isValidEvidenceCreate(reportId) {
+      return exists(/databases/$(database)/documents/reports/$(reportId)) &&
+             (isOfficer() || get(/databases/$(database)/documents/reports/$(reportId)).data.reporterId == request.auth.uid) &&
+             incoming().keys().hasAll(['ownerUid', 'mimeType', 'base64Data', 'fileName', 'byteSize', 'width', 'height', 'createdAt']) &&
+             incoming().keys().hasOnly(['ownerUid', 'mimeType', 'base64Data', 'fileName', 'byteSize', 'width', 'height', 'createdAt']) &&
+             incoming().ownerUid == request.auth.uid &&
+             incoming().mimeType in ['image/jpeg', 'image/png', 'image/webp'] &&
+             incoming().base64Data is string &&
+             incoming().base64Data.size() > 0 &&
+             incoming().base64Data.size() <= 750000 &&
+             incoming().fileName is string &&
+             incoming().fileName.size() > 0 &&
+             incoming().fileName.size() <= 160 &&
+             incoming().byteSize is number &&
+             incoming().byteSize > 0 &&
+             incoming().byteSize <= 870400 &&
+             incoming().width is int &&
+             incoming().width > 0 &&
+             incoming().width <= 1280 &&
+             incoming().height is int &&
+             incoming().height > 0 &&
+             incoming().height <= 1280 &&
+             incoming().createdAt is string;
+    }
+
+    // 1. User Profiles (Private - owners & officers)
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isOfficer();
+      // Self-registration strictly assigns role='citizen'. Officers are provisioned server-side only.
+      allow create: if isOwner(userId) && isValidUserCreate(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidUserSelfUpdate();
+      allow delete: if false;
+    }
+
+    // 2. Authorized Officers Directory (server/Admin SDK managed only)
+    match /officers/{officerId} {
+      allow read: if isOwner(officerId) || isOfficer();
+      allow write: if false;
+    }
+
+    // 3. Private Full Flood Reports (Contains reporterName, reporterPhone, reporterId)
+    match /reports/{reportId} {
+      allow read: if isAuthenticated() && (resource.data.reporterId == request.auth.uid || isOfficer());
+      allow create: if isAuthenticated() && isValidReportCreate(request.resource.data);
+      allow update: if (isOfficer() && isValidReportOfficerUpdate()) || isValidReportOwnerEvidenceUpdate() || isValidReportOwnerAiUpdate();
+      allow delete: if isOfficer() || (isAuthenticated() && resource.data.reporterId == request.auth.uid && resource.data.incidentStatus in ['Submitted', 'Under Review', 'More Info Requested']);
+
+      // 3B. Private Compressed Base64 Photographic Evidence Subcollection (Spark-plan compatible)
+      match /evidence/{evidenceId} {
+        allow read: if isAuthenticated() && (
+          isOfficer() ||
+          (exists(/databases/$(database)/documents/reports/$(reportId)) &&
+           get(/databases/$(database)/documents/reports/$(reportId)).data.reporterId == request.auth.uid)
+        );
+        allow create: if isAuthenticated() && isValidEvidenceCreate(reportId);
+        allow update: if false;
+        allow delete: if isOfficer() || (
+          isAuthenticated() &&
+          exists(/databases/$(database)/documents/reports/$(reportId)) &&
+          get(/databases/$(database)/documents/reports/$(reportId)).data.reporterId == request.auth.uid &&
+          get(/databases/$(database)/documents/reports/$(reportId)).data.incidentStatus in ['Submitted', 'Under Review', 'More Info Requested']
+        );
+      }
+    }
+
+    // 4. Redacted Public Reports for Public Safety Map (Zero PII, Zero Images, 100m Grid Coordinates)
+    match /public_reports/{reportId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated() && isValidPublicReportWrite() && (
+        isOfficer() ||
+        (exists(/databases/$(database)/documents/reports/$(reportId)) &&
+         get(/databases/$(database)/documents/reports/$(reportId)).data.reporterId == request.auth.uid)
+      );
+      allow delete: if isOfficer() || (
+        isAuthenticated() &&
+        exists(/databases/$(database)/documents/reports/$(reportId)) &&
+        get(/databases/$(database)/documents/reports/$(reportId)).data.reporterId == request.auth.uid &&
+        get(/databases/$(database)/documents/reports/$(reportId)).data.incidentStatus in ['Submitted', 'Under Review', 'More Info Requested']
+      );
+    }
+
+    // 5. Flood Hotspot Clusters
+    match /hotspots/{hotspotId} {
+      allow read: if true;
+      allow create, update: if isOfficer();
+      allow delete: if isOfficer();
+    }
+
+    // 6. Real-Time Operational Notifications (scoped by recipientUid)
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && (
+        isOfficer() ||
+        !('recipientUid' in resource.data) ||
+        resource.data.recipientUid == request.auth.uid ||
+        resource.data.recipientUid == 'all'
+      );
+      allow create: if isOfficer() || (
+        isAuthenticated() &&
+        incoming().recipientUid == request.auth.uid &&
+        incoming().type == 'NEW_REPORT'
+      );
+      allow update: if isAuthenticated() && (
+        isOfficer() ||
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['unread']) &&
+          (!('recipientUid' in resource.data) || resource.data.recipientUid == request.auth.uid || resource.data.recipientUid == 'all')
+        )
+      );
+      allow delete: if isOfficer();
+    }
+
+    // 7. Audit Status History Log
+    match /status_history/{historyId} {
+      allow read: if isAuthenticated() && (
+        isOfficer() ||
+        ('reportId' in resource.data &&
+          exists(/databases/$(database)/documents/reports/$(resource.data.reportId)) &&
+          get(/databases/$(database)/documents/reports/$(resource.data.reportId)).data.reporterId == request.auth.uid)
+      );
+      allow create: if isAuthenticated() && (
+        isOfficer() ||
+        ('citizenUid' in incoming() && incoming().citizenUid == request.auth.uid)
+      );
+      allow update, delete: if false;
+    }
+
+    // 8. Audit Hash-Chain Registry (Immutable cryptographic record)
+    match /blockchain_records/{recordId} {
+      allow read: if true;
+      allow create: if isOfficer();
+      allow update, delete: if false;
+    }
+
+    // 9. System Rules & Threshold Settings
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isOfficer();
+    }
+
+    // Deny everything else by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
